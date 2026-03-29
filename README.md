@@ -10,15 +10,21 @@ Marketing agent orchestration gateway for Reverse Ventures.
 
 ## Environment Variables
 
-| Variable | Description |
-|---|---|
-| `SUPABASE_URL` | Your Supabase project URL |
-| `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role key |
-| `AI_PROVIDER` | `openai` or `google` |
-| `OPENAI_API_KEY` | OpenAI API key (if using OpenAI) |
-| `GOOGLE_AI_API_KEY` | Google AI key (if using Google) |
-| `PUBLER_API_KEY` | Publer social media API key |
-| `LATE_API_KEY` | Late.ly API key |
+| Variable | Required | Description |
+|---|---|---|
+| `SUPABASE_URL` | No | Supabase project URL (retained for reference; no direct DB access from this service) |
+| `SUPABASE_WEBHOOK_URL` | Yes | URL of the secure backend webhook that performs Supabase operations |
+| `SUPABASE_WEBHOOK_SECRET` | Yes | Shared secret sent as `Authorization: Bearer <secret>` on every webhook call |
+| `ANTHROPIC_API_KEY` | Yes | Anthropic API key used by the NOVA heartbeat analyser |
+| `AI_PROVIDER` | No | `openai` (default) or `google` |
+| `OPENAI_API_KEY` | No | OpenAI API key (required when `AI_PROVIDER=openai`) |
+| `GOOGLE_AI_API_KEY` | No | Google AI key (required when `AI_PROVIDER=google`) |
+| `PUBLER_API_KEY` | No | Publer social media API key |
+| `LATE_API_KEY` | No | Late.ly API key |
+
+> **Security note:** `SUPABASE_SERVICE_ROLE_KEY` is intentionally absent from this service.
+> All privileged database operations are delegated to the webhook endpoint, which is the
+> only place that should hold the service role key. See `src/webhookHelper.js` for details.
 
 ## Endpoints
 

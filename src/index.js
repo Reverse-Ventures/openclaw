@@ -1,15 +1,19 @@
 const express = require("express");
 const cron = require("node-cron");
-const { createClient } = require("@supabase/supabase-js");
+
+const { callSupabaseWebhook } = require("./webhookHelper");
 
 const app = express();
 app.use(express.json());
 
 // ── Supabase client ─────────────────────────────────────────
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+// The service role key is intentionally NOT used here.
+// All privileged Supabase operations are routed through the secure
+// webhook endpoint (SUPABASE_WEBHOOK_URL) authenticated with
+// SUPABASE_WEBHOOK_SECRET.  See src/webhookHelper.js for details.
+//
+// SUPABASE_URL is retained for reference / future read-only public queries.
+const SUPABASE_URL = process.env.SUPABASE_URL;
 
 // ── AI provider factory ─────────────────────────────────────
 async function aiComplete(systemPrompt, userPrompt, opts = {}) {
@@ -96,47 +100,20 @@ app.post("/heartbeat", async (req, res) => {
   console.log(`[${ts}] 🫀 /heartbeat called — trigger: ${trigger}`);
 
   try {
-    // Read current agent state from Supabase
+    // Read current agent state via the secure webhook (no service role key here)
     const cutoff = new Date(Date.now() - 6 * 3600000).toISOString();
-    const [{ data: logs }, { data: tasks }, { data: goals }] = await Promise.all([
-      supabase
-        .from("agent_logs")
-        .select("agent_key, action, status, message, created_at")
-        .gte("created_at", cutoff)
-        .order("created_at", { ascending: false })
-        .limit(50),
-      supabase
-        .from("agent_tasks")
-        .select("*")
-        .order("created_at", { ascending: false })
-        .limit(20),
-      supabase
-        .from("cmo_agent_goals")
-        .select("*")
-        .limit(20),
-    ]);
+    const stateResponse = await callSupabaseWebhook("read_agent_state", { cutoff });
+    const { logs = [], tasks = [], goals = [] } = stateResponse;
 
-    console.log(`  Supabase state — logs: ${(logs || []).length}, tasks: ${(tasks || []).length}, goals: ${(goals || []).length}`);
+    console.log(`  Webhook state — logs: ${logs.length}, tasks: ${tasks.length}, goals: ${goals.length}`);
 
     // Call Anthropic API for heartbeat analysis
     const Anthropic = require("@anthropic-ai/sdk");
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-    const systemPrompt = `You are NOVA, the AI orchestration layer for the OpenClaw marketing gateway.
-Your job is to analyse the current agent state and produce a concise heartbeat summary.
-Identify any anomalies, stalled tasks, or opportunities, and recommend the next actions.`;
+    const systemPrompt = `You are NOVA, the AI orchestration layer for the OpenClaw marketing gateway.\nYour job is to analyse the current agent state and produce a concise heartbeat summary.\nIdentify any anomalies, stalled tasks, or opportunities, and recommend the next actions.`;
 
-    const userPrompt = `Trigger: ${trigger}
-Timestamp: ${ts}
-
-Recent agent logs (last 6 h):
-${JSON.stringify(logs || [], null, 2)}
-
-Pending / recent tasks:
-${JSON.stringify(tasks || [], null, 2)}
-
-Active CMO goals:
-${JSON.stringify(goals || [], null, 2)}`;
+    const userPrompt = `Trigger: ${trigger}\nTimestamp: ${ts}\n\nRecent agent logs (last 6 h):\n${JSON.stringify(logs, null, 2)}\n\nPending / recent tasks:\n${JSON.stringify(tasks, null, 2)}\n\nActive CMO goals:\n${JSON.stringify(goals, null, 2)}`;
 
     const message = await anthropic.messages.create({
       model: "claude-opus-4-5",
@@ -149,8 +126,8 @@ ${JSON.stringify(goals || [], null, 2)}`;
     const summary = message.content[0].type === "text" ? message.content[0].text : "";
     console.log(`  NOVA summary (${summary.length} chars) generated`);
 
-    // Write results back to agent_logs
-    await supabase.from("agent_logs").insert({
+    // Write heartbeat result back via the secure webhook
+    await callSupabaseWebhook("write_heartbeat", {
       agent_key: "openclaw-nova-heartbeat",
       action: trigger,
       status: "success",
@@ -161,13 +138,16 @@ ${JSON.stringify(goals || [], null, 2)}`;
     res.json({ success: true, summary });
   } catch (err) {
     console.error(`  ❌ /heartbeat error:`, err.message);
-    await supabase.from("agent_logs").insert({
+    // Best-effort error log via webhook — ignore secondary failures
+    callSupabaseWebhook("write_heartbeat", {
       agent_key: "openclaw-nova-heartbeat",
       action: trigger,
       status: "error",
       message: err.message,
       metadata: null,
-    }).then(() => {});
+    }).catch((webhookErr) => {
+      console.error(`  ⚠️  Failed to log heartbeat error via webhook:`, webhookErr.message);
+    });
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -218,7 +198,7 @@ app.post("/agents/:agentName/invoke", async (req, res) => {
     return res.status(404).json({ error: `Agent '${agentName}' not found` });
   }
   try {
-    const result = await agent.invoke({ supabase, aiComplete, body: req.body });
+    const result = await agent.invoke({ callSupabaseWebhook, aiComplete, body: req.body });
     await logAgent(agentName, req.body.action || "invoke", "success", result);
     res.json({ success: true, result });
   } catch (err) {
@@ -229,13 +209,15 @@ app.post("/agents/:agentName/invoke", async (req, res) => {
 
 // ── Agent logging ───────────────────────────────────────────
 async function logAgent(agentKey, action, status, metadata, message) {
-  await supabase.from("agent_logs").insert({
+  await callSupabaseWebhook("write_agent_log", {
     agent_key: `openclaw-${agentKey}-agent`,
     action,
     status,
     message: message || null,
     metadata: metadata ? { result: metadata } : null,
-  }).then(() => {});
+  }).catch((err) => {
+    console.error(`  ⚠️  logAgent webhook failed for ${agentKey}:`, err.message);
+  });
 }
 
 // ── Cron: Heartbeat every hour ──────────────────────────────
@@ -244,7 +226,7 @@ cron.schedule("0 * * * *", async () => {
   for (const [name, agent] of Object.entries(agents)) {
     if (agent.heartbeat) {
       try {
-        await agent.heartbeat({ supabase, aiComplete });
+        await agent.heartbeat({ callSupabaseWebhook, aiComplete });
         console.log(`  ✅ ${name} heartbeat OK`);
       } catch (e) {
         console.error(`  ❌ ${name} heartbeat failed:`, e.message);
@@ -259,4 +241,5 @@ app.listen(PORT, () => {
   console.log(`🚀 OpenClaw Gateway running on port ${PORT}`);
   console.log(`   Agents loaded: ${Object.keys(agents).length}/${agentFiles.length}`);
   console.log(`   AI Provider: ${process.env.AI_PROVIDER || "openai"}`);
+  console.log(`   Supabase webhook: ${process.env.SUPABASE_WEBHOOK_URL ? "configured ✅" : "NOT configured ⚠️"}`);
 });
