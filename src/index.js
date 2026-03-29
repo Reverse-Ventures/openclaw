@@ -71,6 +71,145 @@ app.get("/health", (req, res) => {
   res.json({ status: "healthy", timestamp: new Date().toISOString() });
 });
 
+// ── Execute endpoint ────────────────────────────────────────
+app.post("/execute", async (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  const { tasks = [], source } = req.body;
+  console.log(`[${new Date().toISOString()}] 📥 /execute called from source: ${source}, tasks: ${tasks.length}`);
+
+  const results = [];
+  for (const task of tasks) {
+    const { agent_key, task_type, description, priority } = task;
+    const ts = new Date().toISOString();
+    console.log(`  [${ts}] task agent_key=${agent_key} type=${task_type} priority=${priority} — ${description}`);
+    results.push({ agent_key, task_type, description, priority, logged_at: ts });
+  }
+
+  res.json({ completed: tasks.length, failed: 0, results });
+});
+
+// ── Heartbeat endpoint ──────────────────────────────────────
+app.post("/heartbeat", async (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  const { trigger = "hourly" } = req.body;
+  const ts = new Date().toISOString();
+  console.log(`[${ts}] 🫀 /heartbeat called — trigger: ${trigger}`);
+
+  try {
+    // Read current agent state from Supabase
+    const cutoff = new Date(Date.now() - 6 * 3600000).toISOString();
+    const [{ data: logs }, { data: tasks }, { data: goals }] = await Promise.all([
+      supabase
+        .from("agent_logs")
+        .select("agent_key, action, status, message, created_at")
+        .gte("created_at", cutoff)
+        .order("created_at", { ascending: false })
+        .limit(50),
+      supabase
+        .from("agent_tasks")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(20),
+      supabase
+        .from("cmo_agent_goals")
+        .select("*")
+        .limit(20),
+    ]);
+
+    console.log(`  Supabase state — logs: ${(logs || []).length}, tasks: ${(tasks || []).length}, goals: ${(goals || []).length}`);
+
+    // Call Anthropic API for heartbeat analysis
+    const Anthropic = require("@anthropic-ai/sdk");
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+    const systemPrompt = `You are NOVA, the AI orchestration layer for the OpenClaw marketing gateway.
+Your job is to analyse the current agent state and produce a concise heartbeat summary.
+Identify any anomalies, stalled tasks, or opportunities, and recommend the next actions.`;
+
+    const userPrompt = `Trigger: ${trigger}
+Timestamp: ${ts}
+
+Recent agent logs (last 6 h):
+${JSON.stringify(logs || [], null, 2)}
+
+Pending / recent tasks:
+${JSON.stringify(tasks || [], null, 2)}
+
+Active CMO goals:
+${JSON.stringify(goals || [], null, 2)}`;
+
+    const message = await anthropic.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      messages: [
+        { role: "user", content: `${systemPrompt}\n\n${userPrompt}` },
+      ],
+    });
+
+    const summary = message.content[0].type === "text" ? message.content[0].text : "";
+    console.log(`  NOVA summary (${summary.length} chars) generated`);
+
+    // Write results back to agent_logs
+    await supabase.from("agent_logs").insert({
+      agent_key: "openclaw-nova-heartbeat",
+      action: trigger,
+      status: "success",
+      message: summary.slice(0, 500),
+      metadata: { trigger, summary },
+    });
+
+    res.json({ success: true, summary });
+  } catch (err) {
+    console.error(`  ❌ /heartbeat error:`, err.message);
+    await supabase.from("agent_logs").insert({
+      agent_key: "openclaw-nova-heartbeat",
+      action: trigger,
+      status: "error",
+      message: err.message,
+      metadata: null,
+    }).then(() => {});
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Skills endpoint ─────────────────────────────────────────
+app.get("/skills", (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+
+  // Capability map — one entry per loaded agent
+  const capabilityMap = {
+    "cmo":                  ["orchestrate_agents", "review_goals", "cmo_analysis", "self_heal"],
+    "social":               ["social_media_posting", "engagement_tracking", "platform_scheduling"],
+    "content-factory":      ["content_generation", "blog_writing", "copywriting"],
+    "seo-aeo":              ["seo_optimisation", "keyword_research", "aeo_strategy"],
+    "influencer-outreach":  ["influencer_discovery", "outreach_campaigns", "partnership_tracking"],
+    "community-referral":   ["referral_programme", "community_engagement", "reward_tracking"],
+    "corporate-outreach":   ["b2b_outreach", "lead_generation", "corporate_partnerships"],
+    "affiliate-recruitment":["affiliate_onboarding", "commission_tracking", "partner_recruitment"],
+    "knowledge":            ["knowledge_base_management", "faq_generation", "document_indexing"],
+    "trends":               ["trend_analysis", "market_research", "competitive_intelligence"],
+    "pr-media":             ["press_release_writing", "media_outreach", "brand_monitoring"],
+    "evolution-scout":      ["product_evolution_tracking", "feature_scouting", "roadmap_analysis"],
+    "engagement-scout":     ["audience_engagement_analysis", "sentiment_tracking", "community_health"],
+    "data-collector":       ["data_scraping", "data_aggregation", "source_monitoring"],
+    "data-verifier":        ["data_validation", "quality_assurance", "deduplication"],
+    "funnel-analyst":       ["funnel_analysis", "conversion_optimisation", "drop_off_detection"],
+    "email":                ["email_campaigns", "drip_sequences", "deliverability_monitoring"],
+    "boardy":               ["board_reporting", "executive_summaries", "kpi_dashboards"],
+  };
+
+  const skills = [];
+  for (const [agentName] of Object.entries(agents)) {
+    const capabilities = capabilityMap[agentName] || [];
+    for (const capability of capabilities) {
+      skills.push({ agent: agentName, capability });
+    }
+  }
+
+  console.log(`[${new Date().toISOString()}] 🔍 /skills — returning ${skills.length} capabilities across ${Object.keys(agents).length} agents`);
+  res.json(skills);
+});
+
 // ── Agent invoke endpoint ───────────────────────────────────
 app.post("/agents/:agentName/invoke", async (req, res) => {
   const { agentName } = req.params;
