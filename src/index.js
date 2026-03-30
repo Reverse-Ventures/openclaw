@@ -1,15 +1,9 @@
 const express = require("express");
 const cron = require("node-cron");
-const { createClient } = require("@supabase/supabase-js");
+const { callSupabaseWebhook } = require("./webhookHelper");
 
 const app = express();
 app.use(express.json());
-
-// ── Supabase client ─────────────────────────────────────────
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
 
 // ── AI provider factory ─────────────────────────────────────
 async function aiComplete(systemPrompt, userPrompt, opts = {}) {
@@ -96,27 +90,11 @@ app.post("/heartbeat", async (req, res) => {
   console.log(`[${ts}] 🫀 /heartbeat called — trigger: ${trigger}`);
 
   try {
-    // Read current agent state from Supabase
+    // Read current agent state via webhook
     const cutoff = new Date(Date.now() - 6 * 3600000).toISOString();
-    const [{ data: logs }, { data: tasks }, { data: goals }] = await Promise.all([
-      supabase
-        .from("agent_logs")
-        .select("agent_key, action, status, message, created_at")
-        .gte("created_at", cutoff)
-        .order("created_at", { ascending: false })
-        .limit(50),
-      supabase
-        .from("agent_tasks")
-        .select("*")
-        .order("created_at", { ascending: false })
-        .limit(20),
-      supabase
-        .from("cmo_agent_goals")
-        .select("*")
-        .limit(20),
-    ]);
+    const { logs, tasks, goals } = await callSupabaseWebhook("read_agent_state", { cutoff });
 
-    console.log(`  Supabase state — logs: ${(logs || []).length}, tasks: ${(tasks || []).length}, goals: ${(goals || []).length}`);
+    console.log(`  Agent state — logs: ${(logs || []).length}, tasks: ${(tasks || []).length}, goals: ${(goals || []).length}`);
 
     // Call Anthropic API for heartbeat analysis
     const Anthropic = require("@anthropic-ai/sdk");
@@ -149,8 +127,8 @@ ${JSON.stringify(goals || [], null, 2)}`;
     const summary = message.content[0].type === "text" ? message.content[0].text : "";
     console.log(`  NOVA summary (${summary.length} chars) generated`);
 
-    // Write results back to agent_logs
-    await supabase.from("agent_logs").insert({
+    // Write results back via webhook
+    await callSupabaseWebhook("write_heartbeat", {
       agent_key: "openclaw-nova-heartbeat",
       action: trigger,
       status: "success",
@@ -161,13 +139,13 @@ ${JSON.stringify(goals || [], null, 2)}`;
     res.json({ success: true, summary });
   } catch (err) {
     console.error(`  ❌ /heartbeat error:`, err.message);
-    await supabase.from("agent_logs").insert({
+    await callSupabaseWebhook("write_heartbeat", {
       agent_key: "openclaw-nova-heartbeat",
       action: trigger,
       status: "error",
       message: err.message,
       metadata: null,
-    }).then(() => {});
+    }).catch(() => {});
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -218,7 +196,7 @@ app.post("/agents/:agentName/invoke", async (req, res) => {
     return res.status(404).json({ error: `Agent '${agentName}' not found` });
   }
   try {
-    const result = await agent.invoke({ supabase, aiComplete, body: req.body });
+    const result = await agent.invoke({ callSupabaseWebhook, aiComplete, body: req.body });
     await logAgent(agentName, req.body.action || "invoke", "success", result);
     res.json({ success: true, result });
   } catch (err) {
@@ -229,13 +207,13 @@ app.post("/agents/:agentName/invoke", async (req, res) => {
 
 // ── Agent logging ───────────────────────────────────────────
 async function logAgent(agentKey, action, status, metadata, message) {
-  await supabase.from("agent_logs").insert({
+  await callSupabaseWebhook("write_agent_log", {
     agent_key: `openclaw-${agentKey}-agent`,
     action,
     status,
     message: message || null,
     metadata: metadata ? { result: metadata } : null,
-  }).then(() => {});
+  }).catch(() => {});
 }
 
 // ── Cron: Heartbeat every hour ──────────────────────────────
@@ -244,7 +222,7 @@ cron.schedule("0 * * * *", async () => {
   for (const [name, agent] of Object.entries(agents)) {
     if (agent.heartbeat) {
       try {
-        await agent.heartbeat({ supabase, aiComplete });
+        await agent.heartbeat({ callSupabaseWebhook, aiComplete });
         console.log(`  ✅ ${name} heartbeat OK`);
       } catch (e) {
         console.error(`  ❌ ${name} heartbeat failed:`, e.message);
