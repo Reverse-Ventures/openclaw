@@ -1,15 +1,8 @@
 const express = require("express");
 const cron = require("node-cron");
-const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 app.use(express.json());
-
-// ── Supabase client ─────────────────────────────────────────
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
 
 // ── AI provider factory ─────────────────────────────────────
 async function aiComplete(systemPrompt, userPrompt, opts = {}) {
@@ -95,81 +88,7 @@ app.post("/heartbeat", async (req, res) => {
   const ts = new Date().toISOString();
   console.log(`[${ts}] 🫀 /heartbeat called — trigger: ${trigger}`);
 
-  try {
-    // Read current agent state from Supabase
-    const cutoff = new Date(Date.now() - 6 * 3600000).toISOString();
-    const [{ data: logs }, { data: tasks }, { data: goals }] = await Promise.all([
-      supabase
-        .from("agent_logs")
-        .select("agent_key, action, status, message, created_at")
-        .gte("created_at", cutoff)
-        .order("created_at", { ascending: false })
-        .limit(50),
-      supabase
-        .from("agent_tasks")
-        .select("*")
-        .order("created_at", { ascending: false })
-        .limit(20),
-      supabase
-        .from("cmo_agent_goals")
-        .select("*")
-        .limit(20),
-    ]);
-
-    console.log(`  Supabase state — logs: ${(logs || []).length}, tasks: ${(tasks || []).length}, goals: ${(goals || []).length}`);
-
-    // Call Anthropic API for heartbeat analysis
-    const Anthropic = require("@anthropic-ai/sdk");
-    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-    const systemPrompt = `You are NOVA, the AI orchestration layer for the OpenClaw marketing gateway.
-Your job is to analyse the current agent state and produce a concise heartbeat summary.
-Identify any anomalies, stalled tasks, or opportunities, and recommend the next actions.`;
-
-    const userPrompt = `Trigger: ${trigger}
-Timestamp: ${ts}
-
-Recent agent logs (last 6 h):
-${JSON.stringify(logs || [], null, 2)}
-
-Pending / recent tasks:
-${JSON.stringify(tasks || [], null, 2)}
-
-Active CMO goals:
-${JSON.stringify(goals || [], null, 2)}`;
-
-    const message = await anthropic.messages.create({
-      model: "claude-opus-4-5",
-      max_tokens: 1024,
-      messages: [
-        { role: "user", content: `${systemPrompt}\n\n${userPrompt}` },
-      ],
-    });
-
-    const summary = message.content[0].type === "text" ? message.content[0].text : "";
-    console.log(`  NOVA summary (${summary.length} chars) generated`);
-
-    // Write results back to agent_logs
-    await supabase.from("agent_logs").insert({
-      agent_key: "openclaw-nova-heartbeat",
-      action: trigger,
-      status: "success",
-      message: summary.slice(0, 500),
-      metadata: { trigger, summary },
-    });
-
-    res.json({ success: true, summary });
-  } catch (err) {
-    console.error(`  ❌ /heartbeat error:`, err.message);
-    await supabase.from("agent_logs").insert({
-      agent_key: "openclaw-nova-heartbeat",
-      action: trigger,
-      status: "error",
-      message: err.message,
-      metadata: null,
-    }).then(() => {});
-    res.status(500).json({ success: false, error: err.message });
-  }
+  res.json({ success: true, summary: "Heartbeat received" });
 });
 
 // ── Skills endpoint ─────────────────────────────────────────
@@ -218,7 +137,7 @@ app.post("/agents/:agentName/invoke", async (req, res) => {
     return res.status(404).json({ error: `Agent '${agentName}' not found` });
   }
   try {
-    const result = await agent.invoke({ supabase, aiComplete, body: req.body });
+    const result = await agent.invoke({ aiComplete, body: req.body });
     await logAgent(agentName, req.body.action || "invoke", "success", result);
     res.json({ success: true, result });
   } catch (err) {
@@ -229,13 +148,7 @@ app.post("/agents/:agentName/invoke", async (req, res) => {
 
 // ── Agent logging ───────────────────────────────────────────
 async function logAgent(agentKey, action, status, metadata, message) {
-  await supabase.from("agent_logs").insert({
-    agent_key: `openclaw-${agentKey}-agent`,
-    action,
-    status,
-    message: message || null,
-    metadata: metadata ? { result: metadata } : null,
-  }).then(() => {});
+  console.log(`Logging agent: ${agentKey} - ${action} - ${status}`);
 }
 
 // ── Cron: Heartbeat every hour ──────────────────────────────
@@ -244,7 +157,7 @@ cron.schedule("0 * * * *", async () => {
   for (const [name, agent] of Object.entries(agents)) {
     if (agent.heartbeat) {
       try {
-        await agent.heartbeat({ supabase, aiComplete });
+        await agent.heartbeat({ aiComplete });
         console.log(`  ✅ ${name} heartbeat OK`);
       } catch (e) {
         console.error(`  ❌ ${name} heartbeat failed:`, e.message);
